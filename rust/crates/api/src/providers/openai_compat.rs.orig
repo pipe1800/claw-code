@@ -685,12 +685,8 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": input.to_string()
-                        },
-                        "extra_content": {
-                            "google": {
-                                "thought_signature": "skip_thought_signature_validator"
-                            }
+                            "arguments": input.to_string(),
+                            "thought_signature": ""
                         }
                     })),
                     InputContentBlock::ToolResult { .. } => {}

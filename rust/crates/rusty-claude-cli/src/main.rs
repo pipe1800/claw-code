@@ -24,9 +24,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    resolve_startup_auth_source, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -118,6 +118,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
         } => resume_session(&session_path, &commands),
+        CliAction::ResumePrompt {
+            session_path,
+            prompt,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        } => resume_prompt(&session_path, &prompt, model, output_format, allowed_tools, permission_mode)?,
         CliAction::Status {
             model,
             permission_mode,
@@ -165,6 +173,14 @@ enum CliAction {
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
+    },
+    ResumePrompt {
+        session_path: PathBuf,
+        prompt: String,
+        model: String,
+        output_format: CliOutputFormat,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
     },
     Status {
         model: String,
@@ -339,7 +355,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..]);
+        return parse_resume_args(&rest[1..], model, output_format, allowed_tools, permission_mode_override.unwrap_or_else(default_permission_mode));
     }
     if let Some(action) = parse_single_word_command_alias(&rest, &model, permission_mode_override)
     {
@@ -698,14 +714,38 @@ fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::PrintSystemPrompt { cwd, date })
 }
 
-fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_resume_args(
+    args: &[String],
+    model: String,
+    output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
-        Some(first) if looks_like_slash_command_token(first) => {
+        Some(first) if looks_like_slash_command_token(first) || first == "prompt" => {
             (PathBuf::from(LATEST_SESSION_REFERENCE), args)
         }
         Some(first) => (PathBuf::from(first), &args[1..]),
     };
+
+    if let Some(first) = command_tokens.first() {
+        if first == "prompt" {
+            let prompt = command_tokens[1..].join(" ");
+            if prompt.trim().is_empty() {
+                return Err("prompt subcommand requires a prompt string".to_string());
+            }
+            return Ok(CliAction::ResumePrompt {
+                session_path,
+                prompt,
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+            });
+        }
+    }
+
     let mut commands = Vec::new();
     let mut current_command = String::new();
 
@@ -839,7 +879,7 @@ fn run_login() -> Result<(), Box<dyn std::error::Error>> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
     }
 
-    let client = AnthropicClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
+    let client = api::AnthropicClient::from_auth(AuthSource::None).with_base_url(api::read_base_url());
     let exchange_request =
         OAuthTokenExchangeRequest::from_config(oauth, code, state, pkce.verifier, redirect_uri);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -926,6 +966,26 @@ fn print_system_prompt(cwd: PathBuf, date: String) {
 
 fn print_version() {
     println!("{}", render_version_report());
+}
+
+fn resume_prompt(
+    session_path: &Path,
+    prompt: &str,
+    model: String,
+    output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved_path = if session_path.exists() {
+        session_path.to_path_buf()
+    } else {
+        resolve_session_reference(&session_path.display().to_string())?.path
+    };
+
+    let session = Session::load_from_path(&resolved_path)?;
+    let mut cli = LiveCli::new_from_session(session, model, true, allowed_tools, permission_mode)?;
+    cli.run_turn_with_output(prompt, output_format)?;
+    Ok(())
 }
 
 fn resume_session(session_path: &Path, commands: &[String]) {
@@ -2075,6 +2135,39 @@ impl HookAbortMonitor {
 }
 
 impl LiveCli {
+    fn new_from_session(
+        session: Session,
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let system_prompt = build_system_prompt()?;
+        let session_handle = SessionHandle {
+            id: session.session_id.clone(),
+            path: session.persistence_path().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(format!(".claw/sessions/{}.jsonl", session.session_id))),
+        };
+        let runtime = build_runtime(
+            session.with_persistence_path(session_handle.path.clone()),
+            &session_handle.id,
+            model.clone(),
+            system_prompt.clone(),
+            enable_tools,
+            true,
+            allowed_tools.clone(),
+            permission_mode,
+            None,
+        )?;
+        Ok(Self {
+            model,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session: session_handle,
+        })
+    }
+
     fn new(
         model: String,
         enable_tools: bool,
@@ -4476,7 +4569,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     model: String,
     enable_tools: bool,
     emit_output: bool,
@@ -4497,8 +4590,7 @@ impl AnthropicRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
+            client: ProviderClient::from_model_with_anthropic_auth(&model, resolve_cli_auth_source().ok())?
                 .with_prompt_cache(PromptCache::new(session_id)),
             model,
             enable_tools,
@@ -5302,7 +5394,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));

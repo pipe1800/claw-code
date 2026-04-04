@@ -1,0 +1,18 @@
+--- crates/api/src/providers/openai_compat.rs
++++ crates/api/src/providers/openai_compat.rs
+@@ -685,9 +685,13 @@
+                         "id": id,
+                         "type": "function",
+                         "function": {
+                             "name": name,
+-                            "arguments": input.to_string(),
+-                            "thought_signature": ""
++                            "arguments": input.to_string()
++                        },
++                        "extra_content": {
++                            "google": {
++                                "thought_signature": "skip_thought_signature_validator"
++                            }
+                         }
+                     })),
+                     InputContentBlock::ToolResult { .. } => {}

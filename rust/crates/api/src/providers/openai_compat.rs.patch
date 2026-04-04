@@ -1,0 +1,10 @@
+--- crates/api/src/providers/openai_compat.rs
++++ crates/api/src/providers/openai_compat.rs
+@@ -685,6 +685,7 @@
+                         "function": {
+                             "name": name,
+                             "arguments": input.to_string(),
++                            "thought_signature": ""
+                         }
+                     })),
+                     InputContentBlock::ToolResult { .. } => {}
